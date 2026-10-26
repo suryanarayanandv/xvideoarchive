@@ -138,11 +138,36 @@ class XApiMediaClientTest {
     }
 
     @Test
-    void missingToken_isTransientConfigurationFailure() throws Exception {
-        try (StubHttpServer server = new StubHttpServer()) {
-            PostMediaFetchResult result = client(server, props(600), "").fetchMedia(ingestion("1"));
-            assertThat(result.outcome()).isEqualTo(PostMediaFetchResult.Outcome.TRANSIENT_FAILURE);
+    void missingToken_isNotConfigured_withoutCallingX() throws Exception {
+        AtomicReference<Boolean> called = new AtomicReference<>(false);
+        try (StubHttpServer server = new StubHttpServer().handle("/2/tweets/1", ex -> {
+            called.set(true);
+            StubHttpServer.respond(ex, 200, "application/json", "{}".getBytes());
+        })) {
+            XApiMediaClient client = client(server, props(600), "");
+            org.assertj.core.api.Assertions.assertThatThrownBy(client::verifyConfigured)
+                    .isInstanceOf(MediaProviderNotConfiguredException.class);
+            PostMediaFetchResult result = client.fetchMedia(ingestion("1"));
+            assertThat(result.outcome()).isEqualTo(PostMediaFetchResult.Outcome.NOT_CONFIGURED);
             assertThat(result.reason()).contains("X_BEARER_TOKEN");
+            assertThat(called.get()).isFalse();
+        }
+    }
+
+    @Test
+    void rejectedCredentials_401and403_areNotConfigured_withoutLeakingToken() throws Exception {
+        try (StubHttpServer server = new StubHttpServer()
+                .handle("/2/tweets/401", ex -> StubHttpServer.respond(ex, 401, "application/json", "{}".getBytes()))
+                .handle("/2/tweets/403", ex -> StubHttpServer.respond(ex, 403, "application/json", "{}".getBytes()))) {
+            XApiMediaClient client = client(server, props(600), "secret-bearer");
+            for (String id : new String[]{"401", "403"}) {
+                PostMediaFetchResult result = client.fetchMedia(ingestion(id));
+                assertThat(result.outcome()).isEqualTo(PostMediaFetchResult.Outcome.NOT_CONFIGURED);
+                assertThat(result.reason()).contains("HTTP " + id).doesNotContain("secret-bearer");
+            }
+            try (var entries = Files.list(tempDir)) {
+                assertThat(entries).isEmpty();
+            }
         }
     }
 

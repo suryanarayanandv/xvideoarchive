@@ -4,39 +4,62 @@ import jakarta.transaction.Transactional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 
+/**
+ * Runs one ingestion job: claim (short transaction) -> fetch, extract, recognize (no transaction,
+ * no database locks held during network or FFmpeg work) -> record the outcome (short transaction).
+ * <p>
+ * The claim is an atomic compare-and-set on the job status, so concurrent triggers for the same job
+ * cannot both spend an X read or an AudD request. In-progress states (FETCHING, RECOGNIZING) are
+ * committed and therefore visible to the status endpoints. A claim older than {@code jobs.claim-timeout}
+ * is treated as abandoned (crashed worker) and can be taken over.
+ */
 @Service
 public class ProcessingJobService {
 
     private static final Logger log = LoggerFactory.getLogger(ProcessingJobService.class);
     private static final Duration BASE_BACKOFF = Duration.ofSeconds(30);
     private static final Duration MAX_BACKOFF = Duration.ofHours(1);
+    private static final List<ProcessingJobStatus> CLAIMABLE =
+            List.of(ProcessingJobStatus.PENDING, ProcessingJobStatus.RETRY_WAIT);
+    private static final List<ProcessingJobStatus> IN_PROGRESS =
+            List.of(ProcessingJobStatus.FETCHING, ProcessingJobStatus.RECOGNIZING);
 
     private final ProcessingJobRepository processingJobRepository;
     private final IngestionRepository ingestionRepository;
     private final XPostMediaClient xPostMediaClient;
     private final AudioExtractionService audioExtractionService;
     private final SongRecognitionService songRecognitionService;
+    private final TransactionTemplate tx;
     private final int maxAttempts;
+    private final Duration claimTimeout;
 
     public ProcessingJobService(ProcessingJobRepository processingJobRepository,
                                 IngestionRepository ingestionRepository,
                                 XPostMediaClient xPostMediaClient,
                                 AudioExtractionService audioExtractionService,
                                 SongRecognitionService songRecognitionService,
-                                @Value("${jobs.max-attempts:5}") int maxAttempts) {
+                                PlatformTransactionManager transactionManager,
+                                @Value("${jobs.max-attempts:5}") int maxAttempts,
+                                @Value("${jobs.claim-timeout:15m}") Duration claimTimeout) {
         this.processingJobRepository = processingJobRepository;
         this.ingestionRepository = ingestionRepository;
         this.xPostMediaClient = xPostMediaClient;
         this.audioExtractionService = audioExtractionService;
         this.songRecognitionService = songRecognitionService;
+        this.tx = new TransactionTemplate(transactionManager);
         this.maxAttempts = Math.max(1, maxAttempts);
+        this.claimTimeout = claimTimeout;
     }
 
     @Transactional
@@ -51,105 +74,237 @@ public class ProcessingJobService {
         return ProcessingJobResponse.from(saved);
     }
 
-    @Transactional
     public ProcessingJobResponse processForIngestion(Long ingestionId) {
-        Ingestion ingestion = ingestionRepository.findById(ingestionId)
-                .orElseThrow(() -> new IllegalArgumentException("Ingestion not found: " + ingestionId));
-
-        ProcessingJob job = processingJobRepository.findTopByIngestionIdOrderByCreatedAtDesc(ingestionId)
-                .orElseGet(() -> processingJobRepository.save(new ProcessingJob(ingestionId, "INGESTION")));
-
+        ProcessingJob job = findOrCreateJob(ingestionId);
         if (isTerminal(job.getStatus())) {
             return ProcessingJobResponse.from(job);
         }
+        Long jobId = job.getId();
 
-        // Check the recognizer before fetching, so a missing token never spends X API credits.
+        // Credentials are checked before claiming, so a misconfigured provider neither spends
+        // X API / AudD quota nor uses up the job's retries.
+        String configurationProblem = configurationProblem();
+        if (configurationProblem != null) {
+            return parkUnclaimed(jobId, ingestionId, configurationProblem);
+        }
+
+        if (!claim(jobId, ingestionId)) {
+            // Another worker holds the job, or it finished in the meantime: report its current state.
+            return current(jobId);
+        }
+        return runClaimed(jobId, ingestionId);
+    }
+
+    // --- phase 1: claim -------------------------------------------------------------------------
+
+    private ProcessingJob findOrCreateJob(Long ingestionId) {
+        try {
+            return tx.execute(status -> {
+                ingestionRepository.findById(ingestionId)
+                        .orElseThrow(() -> new IllegalArgumentException("Ingestion not found: " + ingestionId));
+                return processingJobRepository.findTopByIngestionIdOrderByCreatedAtDesc(ingestionId)
+                        .orElseGet(() -> processingJobRepository.save(new ProcessingJob(ingestionId, "INGESTION")));
+            });
+        } catch (DataIntegrityViolationException e) {
+            // A concurrent request created the job first (unique ingestion_id + job_type).
+            return processingJobRepository.findTopByIngestionIdOrderByCreatedAtDesc(ingestionId).orElseThrow(() -> e);
+        }
+    }
+
+    private String configurationProblem() {
         try {
             songRecognitionService.verifyConfigured();
-        } catch (RecognitionNotConfiguredException e) {
-            return waitForConfiguration(job, ingestion, e.getMessage());
+            xPostMediaClient.verifyConfigured();
+            return null;
+        } catch (RecognitionNotConfiguredException | MediaProviderNotConfiguredException e) {
+            return e.getMessage();
         }
+    }
 
-        job.setStatus(ProcessingJobStatus.FETCHING);
-        job.incrementAttempts();
-        processingJobRepository.save(job);
+    private boolean claim(Long jobId, Long ingestionId) {
+        Boolean claimed = tx.execute(status -> {
+            Instant now = Instant.now();
+            int updated = processingJobRepository.claim(jobId, CLAIMABLE, IN_PROGRESS,
+                    ProcessingJobStatus.FETCHING, now.minus(claimTimeout), now);
+            if (updated == 1) {
+                updateIngestionStatus(ingestionId, IngestionStatus.FETCHING);
+            }
+            return updated == 1;
+        });
+        return Boolean.TRUE.equals(claimed);
+    }
 
-        PostMediaFetchResult media = xPostMediaClient.fetchMedia(ingestion);
+    // --- phase 2: work outside any transaction --------------------------------------------------
+
+    private ProcessingJobResponse runClaimed(Long jobId, Long ingestionId) {
+        Ingestion ingestion = ingestionRepository.findById(ingestionId)
+                .orElseThrow(() -> new IllegalArgumentException("Ingestion not found: " + ingestionId));
+
+        PostMediaFetchResult media;
+        try {
+            media = xPostMediaClient.fetchMedia(ingestion);
+        } catch (RuntimeException e) {
+            log.warn("Media provider threw for ingestion {}", ingestionId, e);
+            return complete(jobId, ingestionId, ProcessingJobStatus.FETCHING,
+                    Completion.retry("Media provider error: " + e.getMessage()));
+        }
         if (media == null) {
-            return finish(job, ingestion, ProcessingJobStatus.FAILED, "Media provider returned no result");
+            return complete(jobId, ingestionId, ProcessingJobStatus.FETCHING,
+                    Completion.terminal(ProcessingJobStatus.FAILED, "Media provider returned no result"));
         }
-        if (media.outcome() == PostMediaFetchResult.Outcome.TRANSIENT_FAILURE) {
-            return retryOrFail(job, ingestion, media.reason());
+        switch (media.outcome()) {
+            case NOT_CONFIGURED:
+                return complete(jobId, ingestionId, ProcessingJobStatus.FETCHING, Completion.park(media.reason()));
+            case TRANSIENT_FAILURE:
+                return complete(jobId, ingestionId, ProcessingJobStatus.FETCHING, Completion.retry(media.reason()));
+            case UNAVAILABLE:
+                return complete(jobId, ingestionId, ProcessingJobStatus.FETCHING,
+                        Completion.terminal(ProcessingJobStatus.MEDIA_UNAVAILABLE, media.reason()));
+            default:
+                break;
         }
         if (!media.mediaAvailable()) {
-            return finish(job, ingestion, ProcessingJobStatus.MEDIA_UNAVAILABLE, media.reason());
+            return complete(jobId, ingestionId, ProcessingJobStatus.FETCHING,
+                    Completion.terminal(ProcessingJobStatus.MEDIA_UNAVAILABLE, "Media provider returned no file"));
         }
 
         // The workspace (downloaded media, extracted audio, logs) is deleted whatever happens below.
         try (FetchedMedia fetched = media.media()) {
-            job.setStatus(ProcessingJobStatus.RECOGNIZING);
-            processingJobRepository.save(job);
+            if (!transition(jobId, ingestionId, ProcessingJobStatus.FETCHING, ProcessingJobStatus.RECOGNIZING)) {
+                log.warn("Lost the claim on job {} before recognition; abandoning this run", jobId);
+                return current(jobId);
+            }
+            Completion completion = recognize(ingestionId, fetched);
+            return complete(jobId, ingestionId, ProcessingJobStatus.RECOGNIZING, completion);
+        }
+    }
 
+    private Completion recognize(Long ingestionId, FetchedMedia fetched) {
+        try {
             Path samplePath = fetched.workspace().resolve("sample.wav");
             AudioExtractionResult extraction = audioExtractionService.extractSample(fetched.file(), samplePath);
             if (!extraction.success()) {
                 // Bad or audio-less media is a property of the post, not a transient condition.
-                return finish(job, ingestion, ProcessingJobStatus.MEDIA_UNAVAILABLE, extraction.reason());
+                return Completion.terminal(ProcessingJobStatus.MEDIA_UNAVAILABLE, extraction.reason());
             }
 
-            SongRecognitionResult recognition;
-            try {
-                recognition = songRecognitionService.recognize(extraction.outputPath());
-            } catch (RecognitionNotConfiguredException e) {
-                log.warn("Recognition is not usable for ingestion {}: {}", ingestionId, e.getMessage());
-                job.refundAttempt();
-                return waitForConfiguration(job, ingestion, e.getMessage());
-            } catch (RuntimeException e) {
-                log.warn("Recognition provider failed for ingestion {}: {}", ingestionId, e.getMessage());
-                return retryOrFail(job, ingestion, "Recognition provider error: " + e.getMessage());
-            }
-
+            SongRecognitionResult recognition = songRecognitionService.recognize(extraction.outputPath());
             if (recognition == null || !recognition.matched()) {
-                return finish(job, ingestion, ProcessingJobStatus.NO_MATCH,
+                return Completion.terminal(ProcessingJobStatus.NO_MATCH,
                         recognition == null ? "No recognition result returned" : recognition.reason());
             }
-
-            songRecognitionService.persistMatch(ingestion, recognition);
-            return finish(job, ingestion, ProcessingJobStatus.COMPLETED, null);
+            return Completion.matched(recognition);
+        } catch (RecognitionNotConfiguredException e) {
+            log.warn("Recognition is not usable for ingestion {}: {}", ingestionId, e.getMessage());
+            return Completion.park(e.getMessage());
+        } catch (UnusableAudioException e) {
+            return Completion.terminal(ProcessingJobStatus.MEDIA_UNAVAILABLE, e.getMessage());
+        } catch (RuntimeException e) {
+            log.warn("Recognition failed for ingestion {}: {}", ingestionId, e.getMessage());
+            return Completion.retry("Recognition provider error: " + e.getMessage());
         }
     }
 
-    private static boolean isTerminal(ProcessingJobStatus status) {
-        return status == ProcessingJobStatus.COMPLETED
-                || status == ProcessingJobStatus.MEDIA_UNAVAILABLE
-                || status == ProcessingJobStatus.NO_MATCH
-                || status == ProcessingJobStatus.FAILED;
+    private boolean transition(Long jobId, Long ingestionId, ProcessingJobStatus from, ProcessingJobStatus to) {
+        Boolean moved = tx.execute(status -> {
+            int updated = processingJobRepository.transition(jobId, from, to, Instant.now());
+            if (updated == 1) {
+                updateIngestionStatus(ingestionId, IngestionStatus.valueOf(to.name()));
+            }
+            return updated == 1;
+        });
+        return Boolean.TRUE.equals(moved);
     }
 
-    private ProcessingJobResponse retryOrFail(ProcessingJob job, Ingestion ingestion, String reason) {
-        if (job.getAttempts() >= maxAttempts) {
-            return finish(job, ingestion, ProcessingJobStatus.FAILED,
-                    "Retry limit (" + maxAttempts + ") reached. Last error: " + reason);
+    // --- phase 3: record the outcome ------------------------------------------------------------
+
+    private enum Kind { FINAL, RETRY, PARK }
+
+    private record Completion(Kind kind, ProcessingJobStatus status, String reason, SongRecognitionResult match) {
+        static Completion terminal(ProcessingJobStatus status, String reason) {
+            return new Completion(Kind.FINAL, status, reason, null);
         }
-        long multiplier = 1L << Math.min(job.getAttempts() - 1, 20);
-        Duration backoff = BASE_BACKOFF.multipliedBy(multiplier);
-        if (backoff.compareTo(MAX_BACKOFF) > 0) {
-            backoff = MAX_BACKOFF;
+
+        static Completion matched(SongRecognitionResult match) {
+            return new Completion(Kind.FINAL, ProcessingJobStatus.COMPLETED, null, match);
         }
-        job.setNextAttemptAt(Instant.now().plus(backoff));
-        return finish(job, ingestion, ProcessingJobStatus.RETRY_WAIT, reason);
+
+        static Completion retry(String reason) {
+            return new Completion(Kind.RETRY, ProcessingJobStatus.RETRY_WAIT, reason, null);
+        }
+
+        /** Operator-side problem (credentials): wait without consuming the retry budget. */
+        static Completion park(String reason) {
+            return new Completion(Kind.PARK, ProcessingJobStatus.RETRY_WAIT, reason, null);
+        }
     }
 
-    /**
-     * Credentials are an operator problem, not a property of the post: park the job without
-     * consuming its retry budget, so it can run normally once the token is fixed.
-     */
-    private ProcessingJobResponse waitForConfiguration(ProcessingJob job, Ingestion ingestion, String reason) {
-        job.setNextAttemptAt(Instant.now().plus(MAX_BACKOFF));
-        return finish(job, ingestion, ProcessingJobStatus.RETRY_WAIT, reason);
+    private ProcessingJobResponse complete(Long jobId, Long ingestionId, ProcessingJobStatus heldStatus,
+                                           Completion completion) {
+        try {
+            return tx.execute(status -> applyCompletion(jobId, ingestionId, heldStatus, completion));
+        } catch (RuntimeException e) {
+            if (completion.match() == null) {
+                throw e;
+            }
+            // Saving the match failed (e.g. a concurrent insert of the same song): retry the job later.
+            log.warn("Could not save the match for ingestion {}", ingestionId, e);
+            return tx.execute(status -> applyCompletion(jobId, ingestionId, heldStatus,
+                    Completion.retry("Could not save match: " + e.getMessage())));
+        }
     }
 
-    private ProcessingJobResponse finish(ProcessingJob job, Ingestion ingestion,
+    private ProcessingJobResponse applyCompletion(Long jobId, Long ingestionId, ProcessingJobStatus heldStatus,
+                                                  Completion completion) {
+        ProcessingJob job = processingJobRepository.findById(jobId)
+                .orElseThrow(() -> new IllegalArgumentException("Processing job not found: " + jobId));
+        if (job.getStatus() != heldStatus) {
+            // Our claim expired and another worker took over; its result wins.
+            log.warn("Job {} is {} (expected {}); discarding this run's result", jobId, job.getStatus(), heldStatus);
+            return ProcessingJobResponse.from(job);
+        }
+        Ingestion ingestion = ingestionRepository.findById(ingestionId)
+                .orElseThrow(() -> new IllegalArgumentException("Ingestion not found: " + ingestionId));
+
+        switch (completion.kind()) {
+            case PARK -> {
+                job.refundAttempt();
+                job.setNextAttemptAt(Instant.now().plus(MAX_BACKOFF));
+                return record(job, ingestion, ProcessingJobStatus.RETRY_WAIT, completion.reason());
+            }
+            case RETRY -> {
+                if (job.getAttempts() >= maxAttempts) {
+                    return record(job, ingestion, ProcessingJobStatus.FAILED,
+                            "Retry limit (" + maxAttempts + ") reached. Last error: " + completion.reason());
+                }
+                job.setNextAttemptAt(Instant.now().plus(backoff(job.getAttempts())));
+                return record(job, ingestion, ProcessingJobStatus.RETRY_WAIT, completion.reason());
+            }
+            default -> {
+                if (completion.match() != null) {
+                    songRecognitionService.persistMatch(ingestion, completion.match());
+                }
+                return record(job, ingestion, completion.status(), completion.reason());
+            }
+        }
+    }
+
+    /** Parks a job that was never claimed (configuration missing); leaves in-progress jobs alone. */
+    private ProcessingJobResponse parkUnclaimed(Long jobId, Long ingestionId, String reason) {
+        return tx.execute(status -> {
+            ProcessingJob job = processingJobRepository.findById(jobId)
+                    .orElseThrow(() -> new IllegalArgumentException("Processing job not found: " + jobId));
+            if (!CLAIMABLE.contains(job.getStatus())) {
+                return ProcessingJobResponse.from(job);
+            }
+            Ingestion ingestion = ingestionRepository.findById(ingestionId)
+                    .orElseThrow(() -> new IllegalArgumentException("Ingestion not found: " + ingestionId));
+            job.setNextAttemptAt(Instant.now().plus(MAX_BACKOFF));
+            return record(job, ingestion, ProcessingJobStatus.RETRY_WAIT, reason);
+        });
+    }
+
+    private ProcessingJobResponse record(ProcessingJob job, Ingestion ingestion,
                                          ProcessingJobStatus status, String reason) {
         job.setStatus(status);
         job.setLastError(truncate(reason));
@@ -158,6 +313,30 @@ public class ProcessingJobService {
         ingestion.setStatus(IngestionStatus.valueOf(status.name()));
         ingestionRepository.save(ingestion);
         return ProcessingJobResponse.from(job);
+    }
+
+    private void updateIngestionStatus(Long ingestionId, IngestionStatus status) {
+        ingestionRepository.findById(ingestionId).ifPresent(ingestion -> {
+            ingestion.setStatus(status);
+            ingestionRepository.save(ingestion);
+        });
+    }
+
+    private ProcessingJobResponse current(Long jobId) {
+        return getById(jobId);
+    }
+
+    private static Duration backoff(int attempts) {
+        long multiplier = 1L << Math.min(Math.max(attempts - 1, 0), 20);
+        Duration backoff = BASE_BACKOFF.multipliedBy(multiplier);
+        return backoff.compareTo(MAX_BACKOFF) > 0 ? MAX_BACKOFF : backoff;
+    }
+
+    private static boolean isTerminal(ProcessingJobStatus status) {
+        return status == ProcessingJobStatus.COMPLETED
+                || status == ProcessingJobStatus.MEDIA_UNAVAILABLE
+                || status == ProcessingJobStatus.NO_MATCH
+                || status == ProcessingJobStatus.FAILED;
     }
 
     private static String truncate(String value) {

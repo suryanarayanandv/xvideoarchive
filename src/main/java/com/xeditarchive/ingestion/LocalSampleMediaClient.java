@@ -35,10 +35,19 @@ public class LocalSampleMediaClient implements XPostMediaClient {
     }
 
     @Override
-    public PostMediaFetchResult fetchMedia(Ingestion ingestion) {
+    public void verifyConfigured() {
         if (sampleDirectory == null || !Files.isDirectory(sampleDirectory)) {
-            return PostMediaFetchResult.transientFailure(
+            throw new MediaProviderNotConfiguredException(
                     "media.provider=local-sample is selected but MEDIA_SAMPLE_DIR is not a directory.");
+        }
+    }
+
+    @Override
+    public PostMediaFetchResult fetchMedia(Ingestion ingestion) {
+        try {
+            verifyConfigured();
+        } catch (MediaProviderNotConfiguredException e) {
+            return PostMediaFetchResult.notConfigured(e.getMessage());
         }
         String postId = ingestion.getPlatformPostId();
         if (postId == null || !postId.matches("\\d{1,25}")) {
