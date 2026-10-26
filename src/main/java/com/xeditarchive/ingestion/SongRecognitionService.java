@@ -25,6 +25,10 @@ public class SongRecognitionService {
         return songRecognitionClient.recognize(audioFile);
     }
 
+    public void verifyConfigured() {
+        songRecognitionClient.verifyConfigured();
+    }
+
     @Transactional
     public SongMatch persistMatch(Ingestion ingestion, SongRecognitionResult result) {
         if (result == null || !result.matched()) {
