@@ -61,10 +61,19 @@ public class XApiMediaClient implements XPostMediaClient {
     }
 
     @Override
-    public PostMediaFetchResult fetchMedia(Ingestion ingestion) {
+    public void verifyConfigured() {
         if (bearerToken == null || bearerToken.isBlank()) {
-            return PostMediaFetchResult.transientFailure(
+            throw new MediaProviderNotConfiguredException(
                     "media.provider=x-api is selected but X_BEARER_TOKEN is not configured.");
+        }
+    }
+
+    @Override
+    public PostMediaFetchResult fetchMedia(Ingestion ingestion) {
+        try {
+            verifyConfigured();
+        } catch (MediaProviderNotConfiguredException e) {
+            return PostMediaFetchResult.notConfigured(e.getMessage());
         }
         String postId = ingestion.getPlatformPostId();
         if (postId == null || !postId.matches("\\d{1,25}")) {
@@ -74,6 +83,8 @@ public class XApiMediaClient implements XPostMediaClient {
         JsonNode body;
         try {
             body = lookupPost(postId);
+        } catch (XCredentialsRejectedException e) {
+            return PostMediaFetchResult.notConfigured(e.getMessage());
         } catch (MediaDownloadException e) {
             return e.isTransientFailure()
                     ? PostMediaFetchResult.transientFailure(e.getMessage())
@@ -155,7 +166,8 @@ public class XApiMediaClient implements XPostMediaClient {
         if (status == 401 || status == 403) {
             // Credential or access-tier problem: retryable once the configuration is fixed.
             log.warn("X API rejected the lookup with HTTP {}; check X_BEARER_TOKEN and account credits", status);
-            throw new MediaDownloadException("X API returned HTTP " + status + " (credentials or access)", true);
+            throw new XCredentialsRejectedException("X API returned HTTP " + status
+                    + " (check X_BEARER_TOKEN, credits and app access)");
         }
         if (status == 404) {
             throw new MediaDownloadException("X API: post not found", false);
@@ -167,6 +179,13 @@ public class XApiMediaClient implements XPostMediaClient {
             return objectMapper.readTree(response.body());
         } catch (IOException e) {
             throw new MediaDownloadException("X API returned unparseable JSON", true);
+        }
+    }
+
+    /** 401/403 from the lookup: the app's credentials or access, not the post. */
+    static final class XCredentialsRejectedException extends MediaDownloadException {
+        XCredentialsRejectedException(String message) {
+            super(message, true);
         }
     }
 }
