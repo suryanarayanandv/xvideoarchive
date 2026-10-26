@@ -68,6 +68,8 @@ class MediaPipelineIntegrationTest {
         assumeTrue(AudioExtractionServiceTest.ffmpegAvailable(), "ffmpeg not installed");
         TestMedia.generateVideoWithTone(sampleDir.resolve("9001.mp4"));
         Files.copy(sampleDir.resolve("9001.mp4"), sampleDir.resolve("9002.mp4"));
+        Files.copy(sampleDir.resolve("9001.mp4"), sampleDir.resolve("9004.mp4"));
+        Files.copy(sampleDir.resolve("9001.mp4"), sampleDir.resolve("9005.mp4"));
         Files.writeString(sampleDir.resolve("9003.mp4"), "corrupt");
     }
 
@@ -134,7 +136,42 @@ class MediaPipelineIntegrationTest {
         assertThat(job.status()).isEqualTo("MEDIA_UNAVAILABLE");
         assertThat(processingJobRepository.findById(job.id()).orElseThrow().getLastError())
                 .startsWith("ffmpeg extraction failed");
-        org.mockito.Mockito.verifyNoInteractions(recognitionClient);
+        org.mockito.Mockito.verify(recognitionClient, org.mockito.Mockito.never()).recognize(any());
+        try (var entries = Files.list(workDir)) {
+            assertThat(entries).isEmpty();
+        }
+    }
+
+    @Test
+    void missingToken_parksJobBeforeFetching_withoutUsingRetries() throws Exception {
+        org.mockito.Mockito.doThrow(new RecognitionNotConfiguredException("AUDD_API_TOKEN is not configured."))
+                .when(recognitionClient).verifyConfigured();
+
+        IngestionResponse ingestion = ingestionService.createIngestion("https://x.com/someone/status/9004");
+        ProcessingJobResponse first = processingJobService.processForIngestion(ingestion.id());
+        ProcessingJobResponse second = processingJobService.processForIngestion(ingestion.id());
+
+        assertThat(first.status()).isEqualTo("RETRY_WAIT");
+        assertThat(second.status()).as("never reaches FAILED while the token is missing").isEqualTo("RETRY_WAIT");
+        ProcessingJob stored = processingJobRepository.findById(second.id()).orElseThrow();
+        assertThat(stored.getAttempts()).isZero();
+        assertThat(stored.getLastError()).contains("AUDD_API_TOKEN");
+        org.mockito.Mockito.verify(recognitionClient, org.mockito.Mockito.never()).recognize(any());
+        try (var entries = Files.list(workDir)) {
+            assertThat(entries).isEmpty();
+        }
+    }
+
+    @Test
+    void rejectedToken_atRecognition_refundsAttempt_andCleansUp() throws Exception {
+        when(recognitionClient.recognize(any()))
+                .thenThrow(new RecognitionNotConfiguredException("AudD rejected AUDD_API_TOKEN (error 900)"));
+
+        IngestionResponse ingestion = ingestionService.createIngestion("https://x.com/someone/status/9005");
+        ProcessingJobResponse job = processingJobService.processForIngestion(ingestion.id());
+
+        assertThat(job.status()).isEqualTo("RETRY_WAIT");
+        assertThat(processingJobRepository.findById(job.id()).orElseThrow().getAttempts()).isZero();
         try (var entries = Files.list(workDir)) {
             assertThat(entries).isEmpty();
         }

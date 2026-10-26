@@ -63,6 +63,13 @@ public class ProcessingJobService {
             return ProcessingJobResponse.from(job);
         }
 
+        // Check the recognizer before fetching, so a missing token never spends X API credits.
+        try {
+            songRecognitionService.verifyConfigured();
+        } catch (RecognitionNotConfiguredException e) {
+            return waitForConfiguration(job, ingestion, e.getMessage());
+        }
+
         job.setStatus(ProcessingJobStatus.FETCHING);
         job.incrementAttempts();
         processingJobRepository.save(job);
@@ -93,6 +100,10 @@ public class ProcessingJobService {
             SongRecognitionResult recognition;
             try {
                 recognition = songRecognitionService.recognize(extraction.outputPath());
+            } catch (RecognitionNotConfiguredException e) {
+                log.warn("Recognition is not usable for ingestion {}: {}", ingestionId, e.getMessage());
+                job.refundAttempt();
+                return waitForConfiguration(job, ingestion, e.getMessage());
             } catch (RuntimeException e) {
                 log.warn("Recognition provider failed for ingestion {}: {}", ingestionId, e.getMessage());
                 return retryOrFail(job, ingestion, "Recognition provider error: " + e.getMessage());
@@ -126,6 +137,15 @@ public class ProcessingJobService {
             backoff = MAX_BACKOFF;
         }
         job.setNextAttemptAt(Instant.now().plus(backoff));
+        return finish(job, ingestion, ProcessingJobStatus.RETRY_WAIT, reason);
+    }
+
+    /**
+     * Credentials are an operator problem, not a property of the post: park the job without
+     * consuming its retry budget, so it can run normally once the token is fixed.
+     */
+    private ProcessingJobResponse waitForConfiguration(ProcessingJob job, Ingestion ingestion, String reason) {
+        job.setNextAttemptAt(Instant.now().plus(MAX_BACKOFF));
         return finish(job, ingestion, ProcessingJobStatus.RETRY_WAIT, reason);
     }
 

@@ -93,10 +93,28 @@ class AuddSongRecognitionClientTest {
         Path audio = Files.writeString(tempDirectory.resolve("missing-token.wav"), "audio-bytes");
         AuddSongRecognitionClient client = new AuddSongRecognitionClient(builder, "https://api.audd.io/", " ");
 
-        SongRecognitionResult result = client.recognize(audio);
+        assertThatThrownBy(client::verifyConfigured).isInstanceOf(RecognitionNotConfiguredException.class);
+        assertThatThrownBy(() -> client.recognize(audio))
+                .isInstanceOf(RecognitionNotConfiguredException.class)
+                .hasMessageContaining("AUDD_API_TOKEN");
+        server.verify();
+    }
 
-        assertThat(result.matched()).isFalse();
-        assertThat(result.reason()).contains("AUDD_API_TOKEN");
+    @Test
+    void recognize_treatsRejectedTokenAsConfigurationError_withoutLeakingIt() throws Exception {
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+        server.expect(requestTo("https://api.audd.io/"))
+                .andRespond(withSuccess("""
+                        {"status":"error","error":{"error_code":900,"error_message":"authorization failed"},"request_params":{"api_token":"s***t"}}
+                        """, MediaType.APPLICATION_JSON));
+        Path audio = Files.writeString(tempDirectory.resolve("bad-token.wav"), "audio-bytes");
+        AuddSongRecognitionClient client = new AuddSongRecognitionClient(builder, "https://api.audd.io/", "secret-token");
+
+        assertThatThrownBy(() -> client.recognize(audio))
+                .isInstanceOf(RecognitionNotConfiguredException.class)
+                .hasMessageContaining("error 900")
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain("secret-token"));
         server.verify();
     }
 }

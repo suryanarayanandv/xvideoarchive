@@ -110,6 +110,13 @@ public class ProcessingJob {
         this.attempts += 1;
     }
 
+    /** Gives back an attempt that failed for operator-side reasons (e.g. missing credentials). */
+    public void refundAttempt() {
+        if (this.attempts > 0) {
+            this.attempts -= 1;
+        }
+    }
+
     public Instant getNextAttemptAt() {
         return nextAttemptAt;
     }
